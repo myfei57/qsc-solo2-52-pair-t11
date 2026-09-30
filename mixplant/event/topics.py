@@ -14,6 +14,7 @@ SAMPLER = "sampler"
 RECIPE = "recipe"
 MOIST = "moist"
 STORE = "store"
+RECON = "recon"
 ALARM = "alarm"
 
 TOPICS: tuple[str, ...] = (
@@ -27,6 +28,7 @@ TOPICS: tuple[str, ...] = (
     RECIPE,
     MOIST,
     STORE,
+    RECON,
     ALARM,
 )
 
@@ -41,6 +43,7 @@ _ORIGIN_TOPICS = {
     "recipe": RECIPE,
     "moist": MOIST,
     "store": STORE,
+    "recon": RECON,
     "console": STORE,
 }
 

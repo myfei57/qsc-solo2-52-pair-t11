@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from ..clock import Clock
 from ..errors import NotDurableError, RecordError, RestoreError, UnknownRecordError
@@ -234,6 +234,22 @@ class RecordRepository:
         self._append_entry(JournalEntry(entry_type=ENTRY_APPEND, tick=record.tick, record=record))
         return record
 
+    def tombstone_records(self, targets: Iterable[int], *, reason: str, origin: str, generation: int) -> tuple[Record, ...]:
+        """Neutralise several committed records in one atomic commit."""
+
+        ordered = tuple(dict.fromkeys(targets))
+        for target_seq in ordered:
+            if target_seq < 1 or target_seq > len(self._records):
+                raise UnknownRecordError("tombstone target does not exist", target=target_seq)
+            if target_seq > self._committed_seq:
+                raise RecordError("cannot tombstone a record that was never committed", target=target_seq)
+        if not ordered:
+            return ()
+        records = tuple(self._append_tombstone(target, reason, origin, generation) for target in ordered)
+        self.flush()
+        self.commit_through(records[-1].seq)
+        return records
+
     def rollback_after(
         self,
         seq: int,
@@ -241,10 +257,13 @@ class RecordRepository:
         reason: str,
         origin: str,
         generation: int,
+        exclude_groups: Iterable[str] = (),
     ) -> tuple[Record, ...]:
         """Tombstone every committed record after ``seq`` in one commit."""
 
-        targets = rollback_targets(self._records[: self._committed_seq], seq)
+        targets = rollback_targets(
+            self._records[: self._committed_seq], seq, exclude_groups=tuple(exclude_groups)
+        )
         if not targets:
             return ()
         records = tuple(self._append_tombstone(target, reason, origin, generation) for target in targets)

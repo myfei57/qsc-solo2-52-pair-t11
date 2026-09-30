@@ -16,6 +16,13 @@
 <body>
   <nav><a href="/pages/recipe">recipe</a><a href="/pages/batch">batch</a><a href="/pages/discharge">discharge</a><a href="/pages/alarms">alarms</a></nav>
   <h1>Alarms and audit</h1>
+  <form id="recon-panel">
+    <strong>核对水位 (reconciliation watermark)</strong>:
+    <span class="flag" id="recon-watermark"></span>
+    <span id="recon-counts"></span>
+    <button type="submit" formaction="/api/recon/through">reconcile to head</button>
+    <button type="submit" formaction="/api/recon/publish">publish conclusion</button>
+  </form>
   <form id="note"><input name="name" value="shift.note"><input name="detail" value="checked"><button type="submit">note</button></form>
   <form id="rollup"><button type="submit">production roll-up</button></form>
   <form id="baseline"><input name="name" value="scale.factor"><input name="value" value="1.002"><input name="unit" value="x"><button type="submit">publish baseline</button></form>
@@ -24,6 +31,9 @@
   <script id="plant-state" type="application/json"><!--STATE--></script>
   <script>
     const state = JSON.parse(document.getElementById('plant-state').textContent || '{"alarms":[],"audit":[]}');
+    const recon = state.recon || {};
+    document.getElementById('recon-watermark').textContent = String(recon.watermark_seq ?? 0);
+    document.getElementById('recon-counts').textContent = JSON.stringify(recon.counts || {});
     const alarms = document.querySelector('#alarms tbody');
     for (const entry of state.alarms) {
       const row = document.createElement('tr');

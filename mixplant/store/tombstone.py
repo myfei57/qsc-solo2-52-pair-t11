@@ -26,8 +26,19 @@ def effective_records(records: Iterable[Record]) -> tuple[Record, ...]:
     return tuple(rec for rec in materialised if not rec.is_tombstone and rec.seq not in hidden)
 
 
-def rollback_targets(records: Iterable[Record], after_seq: int) -> tuple[int, ...]:
-    """Return the committed sequences a rollback down to ``after_seq`` hides."""
+def rollback_targets(records: Iterable[Record], after_seq: int, *, exclude_groups=()) -> tuple[int, ...]:
+    """Return the committed sequences a rollback down to ``after_seq`` hides.
 
+    Records whose ``group`` is in ``exclude_groups`` are kept: append only
+    control streams (reconciliation marks, voids, publications) survive a
+    business rollback so the decision to invalidate them is recorded, never
+    deleted.
+    """
+
+    excluded = frozenset(exclude_groups)
     effective = effective_records(records)
-    return tuple(rec.seq for rec in effective if rec.seq > after_seq)
+    return tuple(
+        rec.seq
+        for rec in effective
+        if rec.seq > after_seq and (not excluded or rec.group not in excluded)
+    )

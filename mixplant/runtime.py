@@ -31,6 +31,8 @@ from .plant.controller import PlantController
 from .plant.status import compose_plant_status
 from .plant.tools import integer, number, optional_integer, optional_number, optional_text, text
 from .pump.service import PumpService
+from .recon import PUBLISH_KIND
+from .recon.service import ReconService
 from .recipe.recipe import Recipe
 from .recipe.service import RecipeService
 from .sampler.service import SamplerService
@@ -110,6 +112,7 @@ class PlantRuntime:
         self.pump = PumpService(self.context, self.machines["delivery"])
         self.sampler = SamplerService(self.context, self.recipes, self.machines["delivery"])
         self.audit = AuditService(self.context, self.machines["batch"], alarms=self.alarms)
+        self.recon = ReconService(self.context, self.machines["batch"])
         self.controller = PlantController(self)
         self.boot_report: RestoreReport | None = None
         self._services: dict[str, PlantService] = {
@@ -123,6 +126,7 @@ class PlantRuntime:
             "pump": self.pump,
             "sampler": self.sampler,
             "audit": self.audit,
+            "recon": self.recon,
         }
         self._wire_bus()
 
@@ -175,6 +179,8 @@ class PlantRuntime:
         self.ids.restore("snap", len(self.store.snapshots.load_all()))
         samples = sum(1 for record in self.store.visible() if record.kind == "sampler.record")
         self.ids.restore("sample", samples)
+        conclusions = sum(1 for record in self.store.visible() if record.kind == PUBLISH_KIND)
+        self.ids.restore("concl", conclusions)
 
     def _adopt_records(self) -> None:
         """Adopt everything the stream still carries."""
@@ -284,6 +290,7 @@ class PlantRuntime:
             batches=[batch.describe() for batch in self.batches.all()],
             alarms=self.alarms.recent(),
             facts=self.view.facts(),
+            recon=self.recon.status(),
             config=self.config.describe(),
         )
 
@@ -359,15 +366,49 @@ class PlantRuntime:
         return {"snapshot": snapshot.describe(self.clock.now())}
 
     def rollback(self, seq: int, *, reason: str = "operator rollback") -> dict[str, Any]:
-        """Tombstone every committed record after ``seq``."""
+        """Roll the business ledger back and cascade reconciliation voids."""
 
-        records = self.store.rollback_after(seq, reason=reason, origin="console", generation=0)
-        return {
-            "tombstones": [
-                {"seq": record.seq, "tombstone_of": record.tombstone_of} for record in records
-            ],
-            "watermark": self.store.watermark().describe(),
-        }
+        result = self.recon.rollback(seq, reason=reason)
+        result["watermark"] = self.store.watermark().describe()
+        return result
+
+    def reconcile_through(self, seq: int | None = None, *, action: str = "reconcile") -> dict[str, Any]:
+        """Reconcile up to the commit watermark (or an explicit point)."""
+
+        point = self.store.watermark().committed_seq if seq is None else seq
+        return self.recon.reconcile_through(point, action=action)
+
+    def external_ledger(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Serve the externally readable, reconciled ledger."""
+
+        params = params or {}
+        as_of_seq = params.get("as_of_seq")
+        as_of_tick = params.get("as_of_tick")
+        return self.recon.external(
+            as_of_seq=None if as_of_seq in (None, "") else int(as_of_seq),
+            as_of_tick=None if as_of_tick in (None, "") else int(as_of_tick),
+        )
+
+    def internal_ledger(self) -> dict[str, Any]:
+        """Serve the internal ledger with its reconciliation standing."""
+
+        return self.recon.internal()
+
+    def recon_history(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Serve the result effective at a past tick or sequence."""
+
+        params = params or {}
+        tick = params.get("tick")
+        seq = params.get("seq")
+        return self.recon.history(
+            tick=None if tick in (None, "") else int(tick),
+            seq=None if seq in (None, "") else int(seq),
+        )
+
+    def recon_verify(self) -> dict[str, Any]:
+        """Cross check external, internal and audit consistency."""
+
+        return self.recon.verify()
 
     def advance_ticks(self, ticks: int = 1) -> int:
         """Move the deterministic clock forward and record where it went."""
@@ -478,6 +519,28 @@ class PlantRuntime:
             ),
             "store.rollback": lambda payload: self.rollback(
                 integer(payload, "seq"), reason=optional_text(payload, "reason", "operator rollback")
+            ),
+            "recon.reconcile": lambda payload: self.recon.reconcile(
+                integer(payload, "seq"),
+                idem_key=optional_text(payload, "idem_key", "") or None,
+                note=optional_text(payload, "note", ""),
+            ),
+            "recon.settle": lambda payload: self.recon.settle(
+                integer(payload, "seq"),
+                idem_key=optional_text(payload, "idem_key", "") or None,
+                note=optional_text(payload, "note", ""),
+            ),
+            "recon.reconcile_through": lambda payload: self.reconcile_through(
+                optional_integer(payload, "seq", self.store.watermark().committed_seq),
+                action=optional_text(payload, "action", "reconcile"),
+            ),
+            "recon.void": lambda payload: self.recon.void(
+                integer(payload, "seq"),
+                reason=text(payload, "reason"),
+                idem_key=optional_text(payload, "idem_key", "") or None,
+            ),
+            "recon.publish": lambda payload: self.recon.publish_conclusion(
+                note=optional_text(payload, "note", "")
             ),
             "clock.advance": lambda payload: {"tick": self.advance_ticks(integer(payload, "ticks"))},
         }

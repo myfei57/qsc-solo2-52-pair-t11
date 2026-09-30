@@ -18,6 +18,7 @@ def compose_plant_status(
     batches: list[dict[str, Any]],
     alarms: list[dict[str, Any]],
     facts: Mapping[str, bool],
+    recon: Mapping[str, Any],
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Fold every subsystem view into the document the console serves."""
@@ -34,5 +35,6 @@ def compose_plant_status(
         "batches": list(batches),
         "alarms": list(alarms),
         "facts": dict(facts),
+        "recon": dict(recon),
         "config": dict(config),
     }
