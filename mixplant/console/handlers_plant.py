@@ -23,6 +23,12 @@ def register(router: Router, runtime: Any, pages: Any) -> None:
     router.add("GET", "/api/diagnostics", lambda _: Response.json(runtime.controller.diagnostics()))
     router.add("GET", "/api/records", lambda request: Response.json(runtime.records(dict(request.query))))
     router.add("GET", "/api/history", _history(runtime))
+    router.add("GET", "/api/external", _external(runtime))
+    router.add("GET", "/api/external/state", lambda _: Response.json(runtime.external_state()))
+    router.add("GET", "/api/history-as-of", _history_as_of(runtime))
+    router.add("GET", "/api/reconcile", lambda _: Response.json(runtime.reconcile_status()))
+    router.add("GET", "/api/reconcile/anchor", lambda _: Response.json(runtime.consistency_anchor()))
+    router.add("POST", "/api/reconcile/take", _reconcile(runtime))
 
 
 def _history(runtime: Any):
@@ -33,5 +39,36 @@ def _history(runtime: Any):
         except (TypeError, ValueError) as exc:
             raise ValidationError("tick must be an integer", tick=str(raw)) from exc
         return Response.json(runtime.history(tick))
+
+    return handler
+
+
+def _history_as_of(runtime: Any):
+    def handler(request: Request) -> Response:
+        raw = request.require_field("tick")
+        try:
+            tick = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("tick must be an integer", tick=str(raw)) from exc
+        return Response.json(runtime.history_as_of(tick))
+
+    return handler
+
+
+def _external(runtime: Any):
+    def handler(request: Request) -> Response:
+        return Response.json(runtime.external_query(dict(request.query)))
+
+    return handler
+
+
+def _reconcile(runtime: Any):
+    def handler(request: Request) -> Response:
+        return Response.json(
+            runtime.dispatch(
+                "reconcile.take",
+                {"idem_key": request.body.get("idem_key")} if request.body else {},
+            )
+        )
 
     return handler

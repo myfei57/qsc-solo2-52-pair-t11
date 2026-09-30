@@ -20,6 +20,24 @@ from .watermark import Watermark, advance_watermark
 
 
 @dataclass(frozen=True, slots=True)
+class RollbackOutcome:
+    """The tombstones a rollback appended and the original seqs they hid."""
+
+    rollback_to_seq: int
+    tombstones: tuple[Record, ...]
+    neutralised_seq: tuple[int, ...]
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "rollback_to_seq": self.rollback_to_seq,
+            "tombstones": [
+                {"seq": record.seq, "tombstone_of": record.tombstone_of} for record in self.tombstones
+            ],
+            "neutralised_seq": list(self.neutralised_seq),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RestoreReport:
     """What a restart decided to do."""
 
@@ -242,7 +260,12 @@ class RecordRepository:
         origin: str,
         generation: int,
     ) -> tuple[Record, ...]:
-        """Tombstone every committed record after ``seq`` in one commit."""
+        """Tombstone every committed record after ``seq`` in one commit.
+
+        Returns the tombstone records that were appended.  The original
+        sequences neutralised by the rollback are available on each returned
+        record as ``tombstone_of``.
+        """
 
         targets = rollback_targets(self._records[: self._committed_seq], seq)
         if not targets:
@@ -251,6 +274,16 @@ class RecordRepository:
         self.flush()
         self.commit_through(records[-1].seq)
         return records
+
+    def rollback(self, seq: int, *, reason: str, origin: str, generation: int) -> "RollbackOutcome":
+        """Tombstone after ``seq`` and report the neutralised sequences."""
+
+        tombstones = self.rollback_after(seq, reason=reason, origin=origin, generation=generation)
+        return RollbackOutcome(
+            rollback_to_seq=seq,
+            tombstones=tombstones,
+            neutralised_seq=tuple(record.tombstone_of for record in tombstones if record.tombstone_of),
+        )
 
     def snapshot(self, *, generation: int, validity: Validity, scope: str = "snap") -> Snapshot:
         """Materialise the committed state and store it."""

@@ -11,6 +11,12 @@ from typing import Iterable
 
 from .records import Record
 
+# Boundary and action metadata is retired by its own append-only rules
+# (reconcile.void / action.void), never neutralised by a domain rollback.
+ROLLBACK_EXEMPT_KINDS = frozenset(
+    {"reconcile.checkpoint", "reconcile.void", "action.writeoff", "action.void"}
+)
+
 
 def hidden_sequences(records: Iterable[Record]) -> frozenset[int]:
     """Return the sequences neutralised by the tombstones in ``records``."""
@@ -27,7 +33,17 @@ def effective_records(records: Iterable[Record]) -> tuple[Record, ...]:
 
 
 def rollback_targets(records: Iterable[Record], after_seq: int) -> tuple[int, ...]:
-    """Return the committed sequences a rollback down to ``after_seq`` hides."""
+    """Return the committed sequences a rollback down to ``after_seq`` hides.
+
+    Reconciliation and action metadata is exempt: a checkpoint or a void is
+    historical fact about what was checked, and rolling back domain records
+    must not erase or tombstone it.  The reconciliation layer retires a
+    checkpoint by appending a ``reconcile.void`` instead.
+    """
 
     effective = effective_records(records)
-    return tuple(rec.seq for rec in effective if rec.seq > after_seq)
+    return tuple(
+        rec.seq
+        for rec in effective
+        if rec.seq > after_seq and rec.kind not in ROLLBACK_EXEMPT_KINDS
+    )

@@ -33,6 +33,10 @@ from .plant.tools import integer, number, optional_integer, optional_number, opt
 from .pump.service import PumpService
 from .recipe.recipe import Recipe
 from .recipe.service import RecipeService
+from .reconcile.digest import anchor_projection
+from .reconcile.ledger import ReconciliationLedger
+from .reconcile.policy import VoidPolicy
+from .reconcile_actions import WriteOffService
 from .sampler.service import SamplerService
 from .service_base import PlantService
 from .statemachine.gate import PreGate
@@ -110,6 +114,8 @@ class PlantRuntime:
         self.pump = PumpService(self.context, self.machines["delivery"])
         self.sampler = SamplerService(self.context, self.recipes, self.machines["delivery"])
         self.audit = AuditService(self.context, self.machines["batch"], alarms=self.alarms)
+        self.reconciliation = ReconciliationLedger(self.store, self.ids, policy=VoidPolicy())
+        self.actions = WriteOffService(self.store, self.ids)
         self.controller = PlantController(self)
         self.boot_report: RestoreReport | None = None
         self._services: dict[str, PlantService] = {
@@ -175,6 +181,22 @@ class PlantRuntime:
         self.ids.restore("snap", len(self.store.snapshots.load_all()))
         samples = sum(1 for record in self.store.visible() if record.kind == "sampler.record")
         self.ids.restore("sample", samples)
+        self.ids.restore(
+            "rcpt",
+            sum(1 for record in self.store.committed_records() if record.kind == "reconcile.checkpoint"),
+        )
+        self.ids.restore(
+            "void",
+            sum(1 for record in self.store.committed_records() if record.kind == "reconcile.void"),
+        )
+        self.ids.restore(
+            "wroff",
+            sum(1 for record in self.store.committed_records() if record.kind == "action.writeoff"),
+        )
+        self.ids.restore(
+            "voida",
+            sum(1 for record in self.store.committed_records() if record.kind == "action.void"),
+        )
 
     def _adopt_records(self) -> None:
         """Adopt everything the stream still carries."""
@@ -251,6 +273,7 @@ class PlantRuntime:
             "tick": peak,
             "records": self.store.last_seq(),
             "visible": len(self.store.visible()),
+            "reconcile_watermark": self.reconciliation.watermark().describe(),
             "batches": self.batches.count(),
             "alarms": self.alarms.count(),
             "lines": {line: machine.phase for line, machine in self.machines.items()},
@@ -265,6 +288,7 @@ class PlantRuntime:
             station=self.config.station,
             now=now,
             watermark=self.store.watermark().describe(),
+            reconcile_watermark=self.reconciliation.watermark().describe(),
             subsystems={name: service.status() for name, service in self._services.items()},
             lines={
                 line: {
@@ -358,16 +382,148 @@ class PlantRuntime:
         snapshot = self.store.snapshot(generation=token.value, validity=Validity.of(self.clock.now(), ttl))
         return {"snapshot": snapshot.describe(self.clock.now())}
 
-    def rollback(self, seq: int, *, reason: str = "operator rollback") -> dict[str, Any]:
-        """Tombstone every committed record after ``seq``."""
+    def rollback(
+        self,
+        seq: int,
+        *,
+        reason: str = "operator rollback",
+        idem_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Tombstone every committed record after ``seq`` and void the checks.
 
-        records = self.store.rollback_after(seq, reason=reason, origin="console", generation=0)
+        The store rollback appends tombstones (history stays intact); the
+        reconciliation ledger then retires every checkpoint whose range the
+        rollback reached, scoping each record kind with its frozen policy.  A
+        repeat rollback carrying the same ``idem_key`` appends nothing twice.
+        """
+
+        policy = self.reconciliation.policy
+        outcome = self.store.rollback(seq, reason=reason, origin="console", generation=0)
+        # Boundary metadata (checkpoints, voids, write-off/void actions) is
+        # retired by the reconciliation layer's own append-only rules, never by
+        # the per-kind domain void policy.  Only domain records are scoped.
+        metadata_kinds = frozenset(
+            {"reconcile.checkpoint", "reconcile.void", "action.writeoff", "action.void"}
+        )
+        affected_kinds: dict[str, str] = {}
+        for target_seq in outcome.neutralised_seq:
+            record = self._record_at(target_seq)
+            if record is None or record.kind in metadata_kinds:
+                continue
+            affected_kinds[record.kind] = policy.scope_for(record.kind)
+        if outcome.tombstones:
+            voids = self.reconciliation.void_after(
+                seq,
+                tombstoned_seqs=outcome.neutralised_seq,
+                affected_kinds=affected_kinds,
+                reason=reason,
+                idem_key=idem_key,
+            )
+        else:
+            voids = ()
         return {
-            "tombstones": [
-                {"seq": record.seq, "tombstone_of": record.tombstone_of} for record in records
-            ],
+            **outcome.describe(),
+            "voids": [void.describe() for void in voids],
+            "scope_by_kind": affected_kinds,
             "watermark": self.store.watermark().describe(),
+            "reconcile_watermark": self.reconciliation.watermark().describe(),
         }
+
+    def _record_at(self, seq: int):
+        for record in self.store.committed_records():
+            if record.seq == seq:
+                return record
+        return None
+
+    def reconcile(self, *, idem_key: str | None = None) -> dict[str, Any]:
+        """Advance the reconciliation watermark over everything committed."""
+
+        result = self.reconciliation.reconcile(issuer="console", idem_key=idem_key)
+        return result.describe()
+
+    def external_query(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """The regulator facing read: only reconciled, still-valid records."""
+
+        from .decision.query import query_from_params, run_query
+
+        query = query_from_params(params or {})
+        result = run_query(self.reconciliation.readable_records(), query)
+        document = result.describe()
+        document["reconcile_watermark"] = self.reconciliation.watermark().describe()
+        return document
+
+    def external_state(self) -> dict[str, Any]:
+        """The bounded state view an external consumer is allowed to see."""
+
+        return self.reconciliation.readable_state()
+
+    def history_as_of(self, tick: int) -> dict[str, Any]:
+        """The state at ``tick`` under the boundary that was valid back then."""
+
+        return {
+            "tick": tick,
+            "now": self.clock.now(),
+            "reconcile_watermark": self.reconciliation.checkpoint_at(tick).describe(),
+            "state": self.reconciliation.state_as_of(tick),
+        }
+
+    def reconcile_status(self) -> dict[str, Any]:
+        """Console + audit view of the boundary, policy and all voids."""
+
+        return self.reconciliation.describe()
+
+    def consistency_anchor(self) -> dict[str, Any]:
+        """Prove external query, internal ledger and audit share one anchor.
+
+        The three faces carry different shapes (a state view, a folded ledger,
+        an audit trail), so they are not byte identical.  What the regulator
+        needs is that every face, at the same moment, names the same
+        reconciliation checkpoint and the same slice digest, and that digest
+        still matches the stream.  Each face therefore reports its own
+        projection digest plus the shared anchor; the anchor is verifiable
+        against the journal and identical on all three faces.
+        """
+
+        from .store.replay import reduce_state
+
+        boundary = self.reconciliation.watermark()
+        records = self.reconciliation.readable_records()
+        external = self.external_state()
+        ledger = reduce_state(records)
+        audit_rows = [entry.describe() for entry in self.audit.ledger.entries()]
+        slice_digest = self._slice_digest(boundary.through_seq)
+        shared_anchor = {
+            "checkpoint_id": boundary.checkpoint_id,
+            "through_seq": boundary.through_seq,
+            "digest": boundary.digest,
+        }
+        projections = anchor_projection(external=external, ledger=ledger, audit=audit_rows)
+        faces = {
+            name: {"anchor": dict(shared_anchor), "projection": projections[name]}
+            for name in projections
+        }
+        anchors = [face["anchor"] for face in faces.values()]
+        anchor_consistent = bool(anchors) and all(anchor == anchors[0] for anchor in anchors)
+        return {
+            "reconcile_watermark": boundary.describe(),
+            "slice_digest": slice_digest,
+            "anchor_matches_stream": boundary.digest == slice_digest,
+            "state_faces_identical": external == ledger,
+            "anchor_consistent_across_faces": anchor_consistent,
+            "faces": faces,
+        }
+
+    def _slice_digest(self, through_seq: int) -> str | None:
+        if through_seq <= 0:
+            return None
+        from .reconcile.digest import digest_slice
+
+        return digest_slice(self.store.committed_records(), through_seq=through_seq)
+
+    def reconcile_domain_tip(self) -> int:
+        """Expose the highest domain (non boundary metadata) committed seq."""
+
+        return self.reconciliation._domain_tip()
 
     def advance_ticks(self, ticks: int = 1) -> int:
         """Move the deterministic clock forward and record where it went."""
@@ -477,7 +633,26 @@ class PlantRuntime:
                 ttl_ticks=optional_integer(payload, "ttl_ticks", self.config.defaults.snapshot_ttl_ticks)
             ),
             "store.rollback": lambda payload: self.rollback(
-                integer(payload, "seq"), reason=optional_text(payload, "reason", "operator rollback")
+                integer(payload, "seq"),
+                reason=optional_text(payload, "reason", "operator rollback"),
+                idem_key=optional_text(payload, "idem_key", None) or None,
+            ),
+            "reconcile.take": lambda payload: self.reconcile(
+                idem_key=optional_text(payload, "idem_key", None) or None
+            ),
+            "reconcile.status": lambda payload: self.reconcile_status(),
+            "reconcile.anchor": lambda payload: self.consistency_anchor(),
+            "action.writeoff": lambda payload: self.actions.writeoff(
+                integer(payload, "target_seq"),
+                idem_key=text(payload, "idem_key"),
+                issuer=optional_text(payload, "issuer", "console"),
+                detail=self._detail(payload),
+            ),
+            "action.void": lambda payload: self.actions.void(
+                integer(payload, "target_seq"),
+                idem_key=text(payload, "idem_key"),
+                issuer=optional_text(payload, "issuer", "console"),
+                reason=optional_text(payload, "reason", ""),
             ),
             "clock.advance": lambda payload: {"tick": self.advance_ticks(integer(payload, "ticks"))},
         }

@@ -19,6 +19,7 @@ def compose_plant_status(
     alarms: list[dict[str, Any]],
     facts: Mapping[str, bool],
     config: Mapping[str, Any],
+    reconcile_watermark: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fold every subsystem view into the document the console serves."""
 
@@ -26,6 +27,7 @@ def compose_plant_status(
         "station": station,
         "tick": now,
         "watermark": dict(watermark),
+        "reconcile_watermark": dict(reconcile_watermark or {}),
         "subsystems": dict(subsystems),
         "lines": dict(lines),
         "versioned": dict(versioned),
